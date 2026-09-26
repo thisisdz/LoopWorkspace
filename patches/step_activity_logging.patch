@@ -1,0 +1,407 @@
+diff --git a/Loop/Loop/Managers/LoopDataManager.swift b/Loop/Loop/Managers/LoopDataManager.swift
+index 06cb514..90d26d2 100644
+--- a/Loop/Loop/Managers/LoopDataManager.swift
++++ b/Loop/Loop/Managers/LoopDataManager.swift
+@@ -859,6 +859,163 @@ extension LoopDataManager {
+     /// Executes an analysis of the current data, and recommends an adjustment to the current
+     /// temporary basal rate.
+     ///
++    // MARK: Step study logging (custom)
++
++    /// Writes one CSV row per loop cycle for the step activity study. Never throws; failures only lose the row.
++    private func logStepStudyRow(loopDate: Date, dosingDecision: StoredDosingDecision, error: LoopError?) {
++        dispatchPrecondition(condition: .onQueue(dataAccessQueue))
++
++        let mgdl = HKUnit.milligramsPerDeciliter
++        var row: [String: String] = [:]
++
++        func fmt(_ value: Double?, _ digits: Int = 1) -> String {
++            guard let value = value, value.isFinite else { return "" }
++            return String(format: "%.\(digits)f", value)
++        }
++        func ts(_ date: Date?) -> String {
++            return date.map { StepStudyLogger.timestampFormatter.string(from: $0) } ?? ""
++        }
++
++        // Run metadata
++        row["timestamp_utc"] = ts(loopDate)
++        row["schema_version"] = StepStudyLogger.schemaVersion
++        row["patch_version"] = StepStudyLogger.patchVersion
++        row["loop_completed"] = error == nil ? "1" : "0"
++        row["loop_error"] = error.map { String(String(describing: $0).prefix(200)) } ?? ""
++        row["closed_loop"] = automaticDosingStatus.automaticDosingEnabled ? "1" : "0"
++        row["step_dosing_enabled"] = UserDefaults.standard.stepActivityEffectEnabled ? "1" : "0"
++        row["dosing_strategy"] = settings.automaticDosingStrategy == .automaticBolus ? "automatic_bolus" : "temp_basal_only"
++
++        // Glucose and data quality
++        let glucose = glucoseStore.latestGlucose
++        if let glucose = glucose {
++            row["glucose_time_utc"] = ts(glucose.startDate)
++            row["glucose_mgdl"] = fmt(glucose.quantity.doubleValue(for: mgdl), 0)
++            row["glucose_age_min"] = fmt(loopDate.timeIntervalSince(glucose.startDate) / 60)
++            row["glucose_display_only"] = glucose.isDisplayOnly ? "1" : "0"
++            row["glucose_user_entered"] = glucose.wasUserEntered ? "1" : "0"
++        }
++
++        // Forecasts with and without step activity (same inputs Loop doses from, otherwise)
++        let horizons = [30, 60, 90, 120]
++        let baseInputs = settings.enabledEffects.subtracting(.activity)
++        let forecastWithout = try? predictGlucose(using: baseInputs)
++        let forecastWith = try? predictGlucose(using: baseInputs.union(.activity))
++
++        func forecastValue(_ forecast: [PredictedGlucoseValue]?, minutes: Int) -> Double? {
++            guard let forecast = forecast, let start = forecast.first?.startDate else { return nil }
++            let target = start.addingTimeInterval(TimeInterval(minutes * 60))
++            return forecast.first(where: { $0.startDate >= target })?.quantity.doubleValue(for: mgdl)
++        }
++        for minutes in horizons {
++            row["fc_nosteps_\(minutes)"] = fmt(forecastValue(forecastWithout, minutes: minutes))
++            row["fc_steps_\(minutes)"] = fmt(forecastValue(forecastWith, minutes: minutes))
++        }
++        row["fc_nosteps_eventual"] = fmt(forecastWithout?.last?.quantity.doubleValue(for: mgdl))
++        row["fc_steps_eventual"] = fmt(forecastWith?.last?.quantity.doubleValue(for: mgdl))
++
++        // Each input's contribution from the latest glucose to each horizon
++        func effectDelta(_ effects: [GlucoseEffect]?, minutes: Int) -> Double? {
++            guard let effects = effects, !effects.isEmpty, let start = glucose?.startDate else { return nil }
++            func value(at date: Date) -> Double? {
++                return (effects.last(where: { $0.startDate <= date }) ?? effects.first)?.quantity.doubleValue(for: mgdl)
++            }
++            guard let from = value(at: start), let to = value(at: start.addingTimeInterval(TimeInterval(minutes * 60))) else { return nil }
++            return to - from
++        }
++        let effectSets: [(String, [GlucoseEffect]?)] = [
++            ("insulin", insulinEffect),
++            ("carbs", carbEffect),
++            ("momentum", glucoseMomentumEffect),
++            ("rc", retrospectiveGlucoseEffect),
++            ("activity", activityEffect)
++        ]
++        for (name, effects) in effectSets {
++            for minutes in horizons {
++                row["eff_\(name)_\(minutes)"] = fmt(effectDelta(effects, minutes: minutes))
++            }
++        }
++
++        // Steps and data quality
++        row["step_fetch_status"] = stepActivityStore.lastFetchStatus
++        if let model = stepActivityModel {
++            let recent = model.bins.filter { $0.start >= loopDate.addingTimeInterval(-TimeInterval(30 * 60)) }
++            let walking = recent.filter { $0.steps <= StepActivityModel.walkingMaxStepsPerBin }
++            let brisk = recent.filter { $0.steps > StepActivityModel.walkingMaxStepsPerBin && $0.steps <= StepActivityModel.briskMaxStepsPerBin }
++            let running = recent.filter { $0.steps > StepActivityModel.briskMaxStepsPerBin }
++            row["steps_last30"] = fmt(recent.reduce(0) { $0 + $1.steps }, 0)
++            row["steps_walk_last30"] = fmt(walking.reduce(0) { $0 + $1.steps }, 0)
++            row["steps_brisk_last30"] = fmt(brisk.reduce(0) { $0 + $1.steps }, 0)
++            row["steps_run_last30"] = fmt(running.reduce(0) { $0 + $1.steps }, 0)
++            row["step_bins_last30"] = recent.map { bin -> String in
++                let pace = bin.steps == 0 ? "" : (bin.steps <= StepActivityModel.walkingMaxStepsPerBin ? "w" : (bin.steps <= StepActivityModel.briskMaxStepsPerBin ? "b" : "r"))
++                return "\(Int(bin.steps))\(pace)"
++            }.joined(separator: ";")
++            if let start = glucose?.startDate {
++                row["activity_effect_now"] = fmt(model.value(at: start))
++            }
++        }
++
++        // Core Motion activity classification
++        let (activity, motionStatus) = stepActivityStore.fetchLatestActivity(endingAt: loopDate)
++        row["motion_status"] = motionStatus
++        if let activity = activity {
++            var types: [String] = []
++            if activity.stationary { types.append("stationary") }
++            if activity.walking { types.append("walking") }
++            if activity.running { types.append("running") }
++            if activity.automotive { types.append("automotive") }
++            if activity.cycling { types.append("cycling") }
++            if activity.unknown { types.append("unknown") }
++            row["motion_activity"] = types.joined(separator: ";")
++            switch activity.confidence {
++            case .low: row["motion_confidence"] = "low"
++            case .medium: row["motion_confidence"] = "medium"
++            case .high: row["motion_confidence"] = "high"
++            @unknown default: row["motion_confidence"] = ""
++            }
++            row["motion_start_utc"] = ts(activity.startDate)
++        }
++
++        // Overrides
++        if let override = settings.scheduleOverride, override.isActive(at: loopDate) {
++            switch override.context {
++            case .preset(let preset): row["override"] = "preset:\(preset.name)"
++            case .custom: row["override"] = "custom"
++            case .legacyWorkout: row["override"] = "workout"
++            case .preMeal: row["override"] = "premeal"
++            }
++            row["override_insulin_needs"] = fmt(override.settings.effectiveInsulinNeedsScaleFactor, 2)
++            if let range = override.settings.targetRange {
++                row["override_target_low"] = fmt(range.lowerBound.doubleValue(for: mgdl), 0)
++                row["override_target_high"] = fmt(range.upperBound.doubleValue(for: mgdl), 0)
++            }
++        }
++        if let preMeal = settings.preMealOverride, preMeal.isActive(at: loopDate) {
++            row["premeal_active"] = "1"
++        }
++
++        // Settings in effect (after overrides)
++        row["isf_mgdl_per_u"] = fmt(insulinSensitivityScheduleApplyingOverrideHistory?.quantity(at: loopDate).doubleValue(for: mgdl))
++        row["carb_ratio_g_per_u"] = fmt(carbRatioScheduleApplyingOverrideHistory?.quantity(at: loopDate).doubleValue(for: .gram()))
++        if let targetRange = settings.effectiveGlucoseTargetRangeSchedule()?.quantityRange(at: loopDate) {
++            row["target_low"] = fmt(targetRange.lowerBound.doubleValue(for: mgdl), 0)
++            row["target_high"] = fmt(targetRange.upperBound.doubleValue(for: mgdl), 0)
++        }
++
++        // Insulin and carbs on board, and the dose decision
++        row["iob_u"] = fmt(dosingDecision.insulinOnBoard?.value, 2)
++        row["cob_g"] = fmt(dosingDecision.carbsOnBoard?.quantity.doubleValue(for: .gram()), 0)
++        if let recommendation = dosingDecision.automaticDoseRecommendation {
++            row["rec_temp_basal_u_per_hr"] = fmt(recommendation.basalAdjustment?.unitsPerHour, 3)
++            row["rec_temp_basal_min"] = fmt(recommendation.basalAdjustment.map { $0.duration / 60 }, 0)
++            row["rec_bolus_u"] = fmt(recommendation.bolusUnits, 3)
++            row["rec_enacted"] = (automaticDosingStatus.automaticDosingEnabled && error == nil) ? "1" : "0"
++        }
++
++        StepStudyLogger.shared.append(row, date: loopDate)
++    }
++
+     func loop() {
+ 
+         if let lastLoopCompleted, Date().timeIntervalSince(lastLoopCompleted) < .minutes(2) {
+@@ -921,6 +1078,8 @@ extension LoopDataManager {
+             loopDidComplete(date: date, dosingDecision: dosingDecision, duration: duration)
+         }
+ 
++        logStepStudyRow(loopDate: date, dosingDecision: dosingDecision, error: error)
++
+         logger.default("Loop ended")
+         notify(forChange: .loopFinished)
+ 
+@@ -2740,6 +2899,11 @@ struct StepActivityModel {
+ /// Reads recent step counts from the iPhone's motion coprocessor
+ final class StepActivityStore {
+     private let pedometer = CMPedometer()
++    private let activityManager = CMMotionActivityManager()
++    private let motionQueue = OperationQueue()
++
++    /// Outcome of the most recent step fetch: ok, unavailable, unauthorized, timeout, or error
++    private(set) var lastFetchStatus = "not_run"
+ 
+     static var isAuthorized: Bool {
+         return CMPedometer.isStepCountingAvailable() && CMPedometer.authorizationStatus() == .authorized
+@@ -2747,7 +2911,12 @@ final class StepActivityStore {
+ 
+     /// Synchronously fetches 5-min step bins for the lookback window. Returns nil if unauthorized, on any error, or after a 3 s timeout.
+     func fetchModel(endingAt end: Date) -> StepActivityModel? {
+-        guard Self.isAuthorized else {
++        guard CMPedometer.isStepCountingAvailable() else {
++            lastFetchStatus = "unavailable"
++            return nil
++        }
++        guard CMPedometer.authorizationStatus() == .authorized else {
++            lastFetchStatus = "unauthorized"
+             return nil
+         }
+ 
+@@ -2778,15 +2947,146 @@ final class StepActivityStore {
+         }
+ 
+         guard group.wait(timeout: .now() + 3) == .success else {
++            lastFetchStatus = "timeout"
+             return nil
+         }
+ 
+         lock.lock()
+         defer { lock.unlock() }
+         guard !failed else {
++            lastFetchStatus = "error"
+             return nil
+         }
++        lastFetchStatus = "ok"
+         let bins = steps.map { StepActivityModel.Bin(start: $0.key, steps: $0.value) }.sorted { $0.start < $1.start }
+         return StepActivityModel(bins: bins)
+     }
++
++    /// Most recent Core Motion activity classification in the last 10 minutes, with a status string. Waits at most 1.5 s.
++    func fetchLatestActivity(endingAt end: Date) -> (CMMotionActivity?, String) {
++        guard CMMotionActivityManager.isActivityAvailable() else {
++            return (nil, "unavailable")
++        }
++        guard CMMotionActivityManager.authorizationStatus() == .authorized else {
++            return (nil, "unauthorized")
++        }
++
++        let semaphore = DispatchSemaphore(value: 0)
++        let lock = NSLock()
++        var latest: CMMotionActivity?
++        var status = "error"
++
++        activityManager.queryActivityStarting(from: end.addingTimeInterval(-TimeInterval(10 * 60)), to: end, to: motionQueue) { activities, error in
++            lock.lock()
++            if error == nil {
++                latest = activities?.last
++                status = "ok"
++            }
++            lock.unlock()
++            semaphore.signal()
++        }
++
++        guard semaphore.wait(timeout: .now() + 1.5) == .success else {
++            return (nil, "timeout")
++        }
++        lock.lock()
++        defer { lock.unlock() }
++        return (latest, status)
++    }
++}
++
++
++/// Appends study rows to monthly CSV files in Application Support/StepStudy (not visible in Files; exported from Settings)
++final class StepStudyLogger {
++    static let shared = StepStudyLogger()
++    static let schemaVersion = "1"
++    static let patchVersion = "step-activity-1.1"
++
++    static let columns: [String] = {
++        var columns = [
++            "timestamp_utc", "schema_version", "patch_version", "loop_completed", "loop_error",
++            "closed_loop", "step_dosing_enabled", "dosing_strategy",
++            "glucose_time_utc", "glucose_mgdl", "glucose_age_min", "glucose_display_only", "glucose_user_entered"
++        ]
++        let horizons = [30, 60, 90, 120]
++        for minutes in horizons {
++            columns += ["fc_nosteps_\(minutes)", "fc_steps_\(minutes)"]
++        }
++        columns += ["fc_nosteps_eventual", "fc_steps_eventual"]
++        for name in ["insulin", "carbs", "momentum", "rc", "activity"] {
++            for minutes in horizons {
++                columns.append("eff_\(name)_\(minutes)")
++            }
++        }
++        columns += [
++            "step_fetch_status", "steps_last30", "steps_walk_last30", "steps_brisk_last30", "steps_run_last30",
++            "step_bins_last30", "activity_effect_now",
++            "motion_status", "motion_activity", "motion_confidence", "motion_start_utc",
++            "override", "override_insulin_needs", "override_target_low", "override_target_high", "premeal_active",
++            "isf_mgdl_per_u", "carb_ratio_g_per_u", "target_low", "target_high",
++            "iob_u", "cob_g", "rec_temp_basal_u_per_hr", "rec_temp_basal_min", "rec_bolus_u", "rec_enacted"
++        ]
++        return columns
++    }()
++
++    static let timestampFormatter: ISO8601DateFormatter = {
++        let formatter = ISO8601DateFormatter()
++        formatter.timeZone = TimeZone(identifier: "UTC")
++        return formatter
++    }()
++
++    private static let monthFormatter: DateFormatter = {
++        let formatter = DateFormatter()
++        formatter.locale = Locale(identifier: "en_US_POSIX")
++        formatter.timeZone = TimeZone(identifier: "UTC")
++        formatter.dateFormat = "yyyy-MM"
++        return formatter
++    }()
++
++    private let queue = DispatchQueue(label: "com.loopkit.StepStudyLogger", qos: .utility)
++
++    static var directory: URL? {
++        guard let support = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else {
++            return nil
++        }
++        return support.appendingPathComponent("StepStudy", isDirectory: true)
++    }
++
++    static func logFiles() -> [URL] {
++        guard let directory = directory,
++              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
++            return []
++        }
++        return files.filter { $0.pathExtension == "csv" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
++    }
++
++    private static func escape(_ value: String) -> String {
++        if value.contains(",") || value.contains("\"") || value.contains("\n") {
++            return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
++        }
++        return value
++    }
++
++    func append(_ values: [String: String], date: Date) {
++        queue.async {
++            guard let directory = Self.directory else { return }
++            let protection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
++            let url = directory.appendingPathComponent("loop_study_\(Self.monthFormatter.string(from: date)).csv")
++            let line = Self.columns.map { Self.escape(values[$0] ?? "") }.joined(separator: ",") + "\n"
++            do {
++                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: protection)
++                if !FileManager.default.fileExists(atPath: url.path) {
++                    let header = Self.columns.joined(separator: ",") + "\n"
++                    FileManager.default.createFile(atPath: url.path, contents: Data((header + line).utf8), attributes: protection)
++                } else {
++                    let handle = try FileHandle(forWritingTo: url)
++                    defer { try? handle.close() }
++                    try handle.seekToEnd()
++                    try handle.write(contentsOf: Data(line.utf8))
++                }
++            } catch {
++                // Logging must never affect looping; a failed write only loses this row
++            }
++        }
++    }
+ }
+diff --git a/Loop/Loop/Views/SettingsView+algorithmExperimentsSection.swift b/Loop/Loop/Views/SettingsView+algorithmExperimentsSection.swift
+index b56ac41..5630151 100644
+--- a/Loop/Loop/Views/SettingsView+algorithmExperimentsSection.swift
++++ b/Loop/Loop/Views/SettingsView+algorithmExperimentsSection.swift
+@@ -8,6 +8,7 @@
+ 
+ import Foundation
+ import SwiftUI
++import UIKit
+ import CoreMotion
+ import LoopKit
+ import LoopKitUI
+@@ -127,6 +128,8 @@ extension UserDefaults {
+ public struct StepActivitySelectionView: View {
+     @Binding var isStepActivityEffectEnabled: Bool
+     @State private var authorizationStatus = CMPedometer.authorizationStatus()
++    @State private var exportFiles: [URL] = []
++    @State private var isShowingExport = false
+     private static let pedometer = CMPedometer()
+ 
+     public var body: some View {
+@@ -148,8 +151,19 @@ public struct StepActivitySelectionView: View {
+                     }
+                 }
+             }
++            Section {
++                Button(NSLocalizedString("Export Study Log", comment: "Button to export step study CSV files")) {
++                    exportFiles = StepStudyLogger.logFiles()
++                    isShowingExport = !exportFiles.isEmpty
++                }
++            } footer: {
++                Text(NSLocalizedString("One row per loop cycle with forecasts with and without steps, each input's effect, step and motion data, overrides, settings, and dose recommendations. Files are monthly CSVs.", comment: "Step study log description"))
++            }
+         }
+         .navigationTitle(NSLocalizedString("Step Activity Effect", comment: "Title of step activity experiment"))
++        .sheet(isPresented: $isShowingExport) {
++            StepStudyShareSheet(items: exportFiles)
++        }
+     }
+ 
+     private var statusText: String {
+@@ -170,3 +184,15 @@ public struct StepActivitySelectionView: View {
+         }
+     }
+ }
++
++
++/// Share sheet for exporting the study CSV files (AirDrop, Files, Mail)
++struct StepStudyShareSheet: UIViewControllerRepresentable {
++    let items: [URL]
++
++    func makeUIViewController(context: Context) -> UIActivityViewController {
++        return UIActivityViewController(activityItems: items, applicationActivities: nil)
++    }
++
++    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
++}
